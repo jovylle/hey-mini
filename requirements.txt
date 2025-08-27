@@ -1,0 +1,8 @@
+pvporcupine
+sounddevice
+webrtcvad
+faster-whisper
+numpy
+python-dotenv
+dateparser
+feedparser

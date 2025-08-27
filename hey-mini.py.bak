@@ -1,0 +1,98 @@
+import os, queue, sys, time, subprocess, re, wave
+import numpy as np
+import sounddevice as sd
+import webrtcvad
+from faster_whisper import WhisperModel
+from dotenv import load_dotenv
+import dateparser
+import pvporcupine
+
+# ---------- Config ----------
+load_dotenv()
+ACCESS_KEY = os.getenv("PV_ACCESS_KEY") or ""
+KEYWORD_PATH = os.getenv("PV_KEYWORD_PATH") or ""
+SAMPLE_RATE = 16000
+CHANNELS = 1
+VAD_MODE = 2
+MAX_SPEECH_SEC = 20
+SILENCE_TAIL_MS = 800
+START_WAV = "sounds/start.wav"
+HIT_WAV = "sounds/hotword.wav"
+PROC_WAV = "sounds/processing.wav"
+
+def beep(path):
+    subprocess.run(["afplay", path], check=False)
+
+def to_pcm16(float_frames):
+    return (np.clip(float_frames, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+def write_wav(path, pcm_bytes, sample_rate=16000):
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+
+def record_until_silence(vad, sd_stream):
+    frame_ms = 30
+    frame_len = int(SAMPLE_RATE * frame_ms / 1000)
+    voiced, silence, audio = 0, 0, bytearray()
+    start = time.time()
+    while True:
+        data, _ = sd_stream.read(frame_len)
+        pcm = to_pcm16(data)
+        audio += pcm
+        if vad.is_speech(pcm, SAMPLE_RATE): silence = 0; voiced += frame_ms
+        else: silence += frame_ms
+        if silence >= SILENCE_TAIL_MS and voiced > 0: break
+        if time.time() - start > MAX_SPEECH_SEC: break
+    return bytes(audio)
+
+def transcribe(pcm_bytes):
+    tmp = "/tmp/hey-mini.wav"; write_wav(tmp, pcm_bytes)
+    segments, _ = STT.transcribe(tmp, vad_filter=True, language="en")
+    return " ".join([seg.text.strip() for seg in segments]).strip()
+
+def parse_alarm(text):
+    if not re.search(r"\b(alarm|remind)\b", text, re.I): return None
+    return dateparser.parse(text, settings={"PREFER_DATES_FROM":"future"})
+
+def make_reminder(dt, text):
+    title = f"Alarm: {text}"
+    ds = dt.strftime("%m/%d/%Y %H:%M:%S")
+    script = f'''
+    tell application "Reminders"
+      set newReminder to make new reminder at end of list "Reminders" with properties {{name:"{title}"}}
+      set remind me date of newReminder to date "{ds}"
+    end tell
+    '''
+    subprocess.run(["osascript", "-e", script], check=False)
+
+def say(text): subprocess.run(["say", text], check=False)
+
+def main_loop():
+    global STT
+    STT = WhisperModel("tiny.en", compute_type="int8")
+    vad = webrtcvad.Vad(VAD_MODE)
+    porcupine = pvporcupine.create(access_key=ACCESS_KEY, keyword_paths=[KEYWORD_PATH])
+    frame_length = porcupine.frame_length; sr = porcupine.sample_rate
+    q = queue.Queue()
+    def cb(indata, frames, t, status): q.put(indata.copy())
+    with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=frame_length, callback=cb):
+        print("Listening for 'hey mini'…")
+        while True:
+            indata = q.get()
+            pcm16 = np.frombuffer(to_pcm16(indata), dtype=np.int16)
+            if porcupine.process(pcm16) >= 0:
+                beep(HIT_WAV); say("Yes?")
+                beep(START_WAV)
+                with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as rec:
+                    audio_bytes = record_until_silence(vad, rec)
+                beep(PROC_WAV)
+                text = transcribe(audio_bytes); print("You said:", text)
+                if not text: say("Sorry, I didn't catch that."); continue
+                dt = parse_alarm(text)
+                if dt: make_reminder(dt, text); say(f"Alarm set for {dt.strftime('%I:%M %p on %B %d')}.")
+                else: say(text)
+
+if __name__ == "__main__":
+    try: main_loop()
+    except KeyboardInterrupt: sys.exit(0)

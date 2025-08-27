@@ -1,0 +1,41 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.manifest
+*.spec
+
+# Logs & outputs
+*.log
+*.out
+*.err
+.DS_Store
+/tmp/
+
+# Audio recordings
+*.wav
+*.aiff
+
+# Local settings
+.env
+*.ppn  # Porcupine keyword files
+
+# MacOS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# VSCode / IDEs
+.vscode/
+.idea/
