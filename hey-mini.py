@@ -8,6 +8,11 @@ import dateparser
 import pvporcupine
 from openai import OpenAI
 import feedparser, urllib.parse
+
+import soundfile as sf
+import logging
+
+
 # ---------- Config ----------
 load_dotenv()
 ACCESS_KEY = os.getenv("PV_ACCESS_KEY") or ""
@@ -16,12 +21,37 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 VAD_MODE = 2
 MAX_SPEECH_SEC = 20
-SILENCE_TAIL_MS = 800
+SILENCE_TAIL_MS = 600
 START_WAV = "sounds/start.wav"
 HIT_WAV = "sounds/hotword.wav"
-PROC_WAV = "sounds/processing.wav"
+PROC_WAV = "sounds/mixkit-message-pop-alert-2354.wav"
 
 client = OpenAI()
+
+sd.default.latency = (0.0, 0.0)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler("/tmp/hey-mini.log"), logging.StreamHandler()]
+)
+
+
+def load_wav_np(path):
+    data, sr = sf.read(path, dtype="float32")
+    if sr != 16000:  # optional resample skip if already 16k
+        pass
+    return data, sr
+
+HIT_SND, HIT_SR = load_wav_np(HIT_WAV)
+START_SND, START_SR = load_wav_np(START_WAV)
+PROC_SND, PROC_SR = load_wav_np(PROC_WAV)
+
+def beep_np(data, sr):
+    sd.play(data, sr, blocking=False)
+    
+    
 
 def beep(path):
     subprocess.run(["afplay", path], check=False)
@@ -111,7 +141,9 @@ def fetch_news(topic="", region="PH", limit=3):
 def main_loop():
     global STT
     
-    # STT = WhisperModel("tiny.en", compute_type="int8")
+    logging.info("Booting hey-mini…")
+    logging.info("Whisper model: base.en; VAD_MODE=%s; SILENCE_TAIL_MS=%s", VAD_MODE, SILENCE_TAIL_MS)
+
     STT = WhisperModel("base.en", compute_type="int8")  
     vad = webrtcvad.Vad(VAD_MODE)
     porcupine = pvporcupine.create(access_key=ACCESS_KEY, keywords=["blueberry"])
@@ -124,32 +156,61 @@ def main_loop():
             indata = q.get()
             pcm16 = np.frombuffer(to_pcm16(indata), dtype=np.int16)
             if porcupine.process(pcm16) >= 0:
-                beep(HIT_WAV); say("Yes?")
-                beep(START_WAV)
+                # 1) Hotword hit → quick ping
+                logging.info("Wake word detected.")
+                beep_np(HIT_SND, HIT_SR)
+
+                # 2) Start listening cue
+                
+                logging.info("Start listening.")
+                beep_np(START_SND, START_SR)
+
+                # 3) Record until silence (no TTS here to avoid mic bleed)
                 with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32") as rec:
                     audio_bytes = record_until_silence(vad, rec)
-                beep(PROC_WAV)
+                    
+                logging.info("Recording finished: %d bytes", len(audio_bytes))
+
+                # 4) Processing cue (user can stop talking; expect answer)
+                beep_np(PROC_SND, PROC_SR)
+                logging.info("Transcribing…")
+
+                # 5) Transcribe + act
                 text = transcribe(audio_bytes); print("You said:", text)
+                logging.info("Transcript: %s", text if text else "<empty>")
                 
                 if not text:
-                  say("Sorry, I didn't catch that.")
-                  continue
-                result = nlu(text)
+                    logging.info("No speech; replying apology.")
+                    say("Sorry, I didn't catch that.")
+                    continue
+
+                try:
+                    result = nlu(text)
+                    logging.info("NLU: %s", result)
+
+                except Exception:
+                    logging.exception("NLU error")
+                    say("I had an error understanding that.")
+                    continue
 
                 if result["action"] == "set_alarm":
-                    dt = dateparser.parse(result["time_text"] or text, settings={"PREFER_DATES_FROM":"future"})
+                    logging.info("Action: set_alarm; time_text=%s", result.get("time_text"))
+
+                    dt = dateparser.parse(result.get("time_text") or text,
+                                        settings={"PREFER_DATES_FROM":"future"})
                     if dt:
                         make_reminder(dt, text)
-                        say(result["reply"] or f"Alarm set for {dt.strftime('%I:%M %p on %B %d')}.")
+                        say(result.get("reply") or f"Alarm set for {dt.strftime('%I:%M %p on %B %d')}.")
                     else:
                         say("I couldn't parse the time.")
                 elif result["action"] == "get_news":
+                    logging.info("Action: get_news; topic=%s region=%s", result.get("topic"), result.get("region"))
                     topic = (result.get("topic") or "").strip()
                     region = (result.get("region") or "PH").strip()
                     try:
                         headlines = fetch_news(topic=topic, region=region, limit=3)
                         if headlines:
-                            say(result["reply"] or "Here are top stories.")
+                            say(result.get("reply") or "Here are top stories.")
                             for h in headlines:
                                 say(h)
                         else:
@@ -157,8 +218,15 @@ def main_loop():
                     except Exception:
                         say("News is unavailable right now.")
                 else:
+                    logging.info("Action: echo")
+                    logging.info("Echoing user input: %s", text)
                     say(result.get("reply", "Okay."))
 
 if __name__ == "__main__":
-    try: main_loop()
-    except KeyboardInterrupt: sys.exit(0)
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception:
+        logging.exception("Fatal error")
+        sys.exit(1)
